@@ -51,3 +51,4 @@ codex plugin marketplace remove codex-plugins
 | 插件 | 说明 |
 | --- | --- |
 | `starter` | 最小模板插件，用来验证市场链路是否通，也当写新插件的样板。 |
+| `marketplace-explorer` | 扫描全部插件市场，翻成中文并生成可搜索的 HTML 目录；也能单独查看某个插件的具体内容。 |

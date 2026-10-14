@@ -1,0 +1,38 @@
+{
+  "name": "marketplace-explorer",
+  "version": "0.1.0",
+  "description": "Browse, translate, and inspect every plugin in your Codex marketplaces.",
+  "author": {
+    "name": "lcl974",
+    "url": "https://github.com/lcl974"
+  },
+  "homepage": "https://github.com/lcl974/codex-plugins",
+  "repository": "https://github.com/lcl974/codex-plugins",
+  "license": "MIT",
+  "keywords": [
+    "marketplace",
+    "catalog",
+    "translation",
+    "chinese",
+    "inspect"
+  ],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "插件市场浏览器",
+    "shortDescription": "把插件市场翻成中文并查看插件具体内容",
+    "longDescription": "扫描 Codex 里配置的全部插件市场，读取每个插件自己的清单、技能、命令、子代理和 MCP 配置，生成一个可搜索的中文 HTML 目录；也可以单独把某个插件的完整内容摊开讲清楚。翻译走 config.toml 里已配置的模型接口，结果缓存在 zh.json，只翻增量。",
+    "developerName": "lcl974",
+    "category": "开发者工具",
+    "capabilities": [
+      "Read",
+      "Write"
+    ],
+    "websiteURL": "https://github.com/lcl974/codex-plugins",
+    "defaultPrompt": [
+      "生成插件市场的中文目录",
+      "帮我看看 figma 这个插件具体能干什么"
+    ],
+    "brandColor": "#7C3AED",
+    "screenshots": []
+  }
+}

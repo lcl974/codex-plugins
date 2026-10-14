@@ -17,6 +17,20 @@
       },
       "category": "Developer Tools",
       "description": "最小模板插件：一个 manifest + 一个 skill，用来验证市场链路，也当写新插件的样板。"
+    },
+    {
+      "name": "marketplace-explorer",
+      "displayName": "插件市场浏览器",
+      "source": {
+        "source": "local",
+        "path": "./plugins/marketplace-explorer"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Developer Tools",
+      "description": "扫描全部插件市场，翻译成中文并生成可搜索的 HTML 目录，也能单独查看某个插件的具体内容。"
     }
   ]
 }
