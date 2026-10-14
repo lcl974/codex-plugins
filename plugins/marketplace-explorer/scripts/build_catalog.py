@@ -15,6 +15,7 @@ import argparse
 import glob
 import json
 import os
+import platform
 import re
 import subprocess
 import sys
@@ -57,7 +58,9 @@ def load_inventory(codex: str) -> dict:
     return json.loads(proc.stdout)
 
 
-def read_manifest(plugin_dir: Path) -> dict:
+def read_manifest(plugin_dir: Path | None) -> dict:
+    if plugin_dir is None:
+        return {}
     for d in MANIFEST_DIRS:
         candidate = plugin_dir / d / MANIFEST_NAME
         if candidate.is_file():
@@ -95,8 +98,10 @@ def first_heading(text: str) -> str:
     return ""
 
 
-def collect_markdown_dir(plugin_dir: Path, sub: str) -> list[dict]:
+def collect_markdown_dir(plugin_dir: Path | None, sub: str) -> list[dict]:
     out = []
+    if plugin_dir is None:
+        return out
     base = plugin_dir / sub
     if not base.is_dir():
         return out
@@ -117,7 +122,9 @@ def collect_markdown_dir(plugin_dir: Path, sub: str) -> list[dict]:
     return out
 
 
-def collect_skills(plugin_dir: Path, manifest: dict) -> list[dict]:
+def collect_skills(plugin_dir: Path | None, manifest: dict) -> list[dict]:
+    if plugin_dir is None:
+        return []
     roots = []
     declared = manifest.get("skills")
     if isinstance(declared, str):
@@ -146,8 +153,10 @@ def collect_skills(plugin_dir: Path, manifest: dict) -> list[dict]:
     return list(seen.values())
 
 
-def collect_mcp_servers(plugin_dir: Path, manifest: dict) -> list[str]:
-    names: list[str] = []
+def collect_mcp(plugin_dir: Path | None, manifest: dict) -> dict:
+    servers: dict[str, str] = {}
+    if plugin_dir is None:
+        return {"servers": [], "remote": [], "local": []}
     candidates = []
     declared = manifest.get("mcpServers")
     if isinstance(declared, str):
@@ -160,10 +169,162 @@ def collect_mcp_servers(plugin_dir: Path, manifest: dict) -> list[str]:
             data = json.loads(candidate.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
             continue
-        servers = data.get("mcpServers") or data.get("servers") or {}
-        if isinstance(servers, dict):
-            names.extend(sorted(servers.keys()))
-    return sorted(set(names))
+        block = data.get("mcpServers") or data.get("servers") or {}
+        if not isinstance(block, dict):
+            continue
+        for name, spec in block.items():
+            kind = "local"
+            if isinstance(spec, dict) and any(k in spec for k in ("url", "serverUrl", "httpUrl", "endpoint")):
+                kind = "remote"
+            servers[name] = kind
+    return {
+        "servers": sorted(servers),
+        "remote": sorted(n for n, k in servers.items() if k == "remote"),
+        "local": sorted(n for n, k in servers.items() if k == "local"),
+    }
+
+
+SCRIPT_SUFFIXES = {".py", ".js", ".mjs", ".cjs", ".ts", ".sh", ".ps1", ".cmd", ".bat", ".exe", ".rb", ".go"}
+
+
+def collect_scripts(plugin_dir: Path | None, manifest: dict) -> list[str]:
+    """Executable code shipped inside the plugin (excluding vendored node_modules)."""
+    if plugin_dir is None:
+        return []
+    roots = []
+    declared = manifest.get("scripts")
+    if isinstance(declared, str):
+        roots.append(plugin_dir / declared.lstrip("./"))
+    roots.append(plugin_dir / "scripts")
+    roots.append(plugin_dir / "bin")
+
+    found: set[str] = set()
+    for root in roots:
+        if not root.is_dir():
+            continue
+        for path in root.rglob("*"):
+            if not path.is_file() or "node_modules" in path.parts:
+                continue
+            if path.suffix.lower() in SCRIPT_SUFFIXES:
+                found.add(str(path.relative_to(plugin_dir)))
+    return sorted(found)
+
+
+TIER_ORDER = {"推荐": 0, "可用": 1, "仅接口": 2, "需确认": 3, "未下载": 4, "不可用": 5}
+
+OFFICIAL_MARKETS = {"openai-bundled", "openai-primary-runtime", "openai-api-curated"}
+
+MACOS_RE = re.compile(
+    r"\b(xcode\w*|macos|mac app\w*|appkit|swiftpm|app intents|liquid glass|notariz\w*|ios app\w*|ios simulator|ipados)\b",
+    re.I,
+)
+ANDROID_RE = re.compile(
+    r"\b(android emulator|android sdk|avd|adb|logcat|simpleperf|perfetto|gfxinfo)\b", re.I
+)
+
+
+def detect_platform(record: dict) -> str:
+    blob = " ".join([record["summary"], record["details"]] + [s["name"] for s in record["skills"]])
+    blob = blob.replace("-", " ").replace("_", " ")
+    if MACOS_RE.search(blob):
+        return "需要 macOS"
+    if ANDROID_RE.search(blob):
+        return "需要 Android 环境"
+    return "通用"
+
+
+def score_plugin(record: dict, host_os: str, local_available: bool) -> dict:
+    """Four gates (source / auto-execution / substance / platform) plus cost labels.
+
+    Metadata-only: it decides whether a plugin is *safe and substantive*, not whether it is
+    useful for a particular job. Usefulness needs the user's own context.
+    """
+    official = record["marketplace"] in OFFICIAL_MARKETS or record["developer"] == "OpenAI"
+    has_license = bool(record["license"] or record["licenseFile"])
+    workflow = bool(record["skills"] or record["commands"] or record["agents"])
+    has_mcp = bool(record["mcp"]["servers"])
+    platform = detect_platform(record)
+    remote_mcp = bool(record["mcp"]["remote"])
+    skills_with_desc = [s for s in record["skills"] if s["description"]]
+    coverage = len(skills_with_desc) / len(record["skills"]) if record["skills"] else 0.0
+    content_strong = (len(skills_with_desc) >= 3 and coverage >= 0.8) or bool(record["commands"])
+
+    notes: list[str] = []
+    risks: list[str] = []
+    costs: list[str] = []
+
+    if not local_available:
+        risks.append("远程 Git 源，本地尚未下载，内容无法检查")
+        return {
+            "tier": "未下载",
+            "platform": "未知",
+            "needsAccount": False,
+            "contentStrong": False,
+            "skillCount": 0,
+            "notes": notes,
+            "risks": risks,
+            "costs": costs,
+        }
+
+    # gate 1 - source
+    if official:
+        source_ok = True
+        notes.append(f"来自 OpenAI 精选/自带市场（{record['marketplace']}）")
+    elif record["developer"] and has_license and record["privacyPolicy"] and record["termsOfService"]:
+        source_ok = True
+        notes.append(f"第三方市场，署名 {record['developer']}，许可 / 隐私政策 / 条款齐全")
+    else:
+        source_ok = False
+        risks.append("来源信息不全：自建市场，或缺少署名、许可、隐私政策")
+
+    # gate 2 - automatic execution
+    if record["hasHooks"]:
+        risks.append("带 hooks：写入文件后会自动运行插件里的脚本")
+    # gate 3 - substance
+    if not workflow and not has_mcp:
+        risks.append("空壳：没有技能、命令，也没有 MCP 接口")
+    elif not workflow:
+        risks.append("只有 MCP 接口，没有技能说明该怎么用")
+    # gate 4 - platform
+    if platform != "通用":
+        risks.append(f"{platform}，当前是 {host_os}")
+
+    if remote_mcp:
+        costs.append("需要第三方账号（远程 MCP 服务）")
+    if "Write" in record["capabilities"]:
+        costs.append("会写文件")
+    if record["apps"]:
+        costs.append("需要界面交互")
+    if record["scripts"]:
+        costs.append(f"附带 {len(record['scripts'])} 个脚本")
+    if record["installed"]:
+        notes.append("已安装")
+    if content_strong:
+        notes.append(f"内容扎实：{len(record['skills'])} 个技能 / {len(record['commands'])} 个命令")
+
+    if platform == "需要 macOS" and host_os != "Darwin":
+        tier = "不可用"
+    elif not workflow and not has_mcp:
+        tier = "不可用"
+    elif record["hasHooks"] or not source_ok:
+        tier = "需确认"
+    elif not workflow:
+        tier = "仅接口"
+    elif not content_strong:
+        tier = "可用"
+    else:
+        tier = "推荐"
+
+    return {
+        "tier": tier,
+        "platform": platform,
+        "needsAccount": remote_mcp,
+        "contentStrong": content_strong,
+        "skillCount": len(record["skills"]),
+        "notes": notes,
+        "risks": risks,
+        "costs": costs,
+    }
 
 
 def as_list(value) -> list:
@@ -178,17 +339,23 @@ def as_list(value) -> list:
 
 
 def plugin_record(entry: dict) -> dict:
-    plugin_dir = Path(entry.get("source", {}).get("path", ""))
+    raw_path = entry.get("source", {}).get("path", "") or ""
+    candidate = Path(raw_path)
+    local_available = bool(raw_path) and candidate.is_absolute() and candidate.is_dir()
+    plugin_dir = candidate if local_available else None
     manifest = read_manifest(plugin_dir)
     interface = manifest.get("interface") or {}
-    return {
+    license_files = sorted(p.name for p in plugin_dir.glob("LICENSE*")) if plugin_dir else []
+    record = {
         "pluginId": entry.get("pluginId") or f"{entry.get('name')}@{entry.get('marketplaceName')}",
-        "name": entry.get("name", plugin_dir.name),
+        "name": entry.get("name") or (plugin_dir.name if plugin_dir else raw_path),
         "displayName": interface.get("displayName") or manifest.get("name") or entry.get("name", ""),
         "marketplace": entry.get("marketplaceName", ""),
         "version": entry.get("version") or manifest.get("version", ""),
         "installed": bool(entry.get("installed")),
         "enabled": bool(entry.get("enabled")),
+        "installPolicy": entry.get("installPolicy", ""),
+        "authPolicy": entry.get("authPolicy", ""),
         "category": interface.get("category") or "",
         "summary": interface.get("shortDescription") or manifest.get("description", ""),
         "details": interface.get("longDescription") or manifest.get("description", ""),
@@ -197,17 +364,34 @@ def plugin_record(entry: dict) -> dict:
         "developer": interface.get("developerName") or (manifest.get("author") or {}).get("name", ""),
         "homepage": interface.get("websiteURL") or manifest.get("homepage", ""),
         "license": manifest.get("license", ""),
+        "licenseFile": bool(license_files),
+        "privacyPolicy": interface.get("privacyPolicyURL", ""),
+        "termsOfService": interface.get("termsOfServiceURL", ""),
         "commands": collect_markdown_dir(plugin_dir, "commands"),
         "agents": collect_markdown_dir(plugin_dir, "agents"),
         "skills": collect_skills(plugin_dir, manifest),
-        "mcpServers": collect_mcp_servers(plugin_dir, manifest),
-        "hasHooks": (plugin_dir / "hooks.json").is_file(),
-        "path": str(plugin_dir),
+        "mcp": collect_mcp(plugin_dir, manifest),
+        "scripts": collect_scripts(plugin_dir, manifest),
+        "hasHooks": bool(plugin_dir and (plugin_dir / "hooks.json").is_file()),
+        "apps": bool(plugin_dir and (plugin_dir / ".app.json").is_file()),
+        "localAvailable": local_available,
+        "path": raw_path or "(未下载)",
     }
+    record["quality"] = score_plugin(record, platform.system(), local_available)
+    return record
 
 
 def build(records: list[dict]) -> list[dict]:
-    records.sort(key=lambda r: (r["marketplace"], r["category"], r["displayName"].lower()))
+    records.sort(
+        key=lambda r: (
+            TIER_ORDER.get(r["quality"]["tier"], 9),
+            0 if r["quality"]["contentStrong"] else 1,
+            -r["quality"]["skillCount"],
+            r["marketplace"],
+            r["category"],
+            r["displayName"].lower(),
+        )
+    )
     return records
 
 
@@ -257,6 +441,12 @@ main{padding:20px 24px 60px;display:grid;gap:14px;grid-template-columns:repeat(a
 .badge{font-size:11px;border-radius:999px;padding:2px 8px;border:1px solid var(--line);color:var(--dim)}
 .badge.on{color:#fff;background:var(--ok);border-color:var(--ok)}
 .badge.cat{color:var(--warn);border-color:var(--warn)}
+.badge.tier-good{color:#fff;background:#1f6feb;border-color:#1f6feb}
+.badge.tier-ok{color:#0b3d2c;background:#3fb950;border-color:#3fb950}
+.badge.tier-info{color:#a5d6ff;border-color:#30455f}
+.badge.tier-warn{color:#f0b429;border-color:#f0b429}
+.badge.tier-none{color:#8b949e;border-color:#30363d}
+.badge.tier-bad{color:#f85149;border-color:#f85149}
 .summary{font-size:13px}
 .orig{color:var(--dim);font-size:12px;font-style:italic}
 details{border-top:1px dashed var(--line);padding-top:8px}
@@ -277,26 +467,30 @@ JS = """
 const q = document.getElementById('q');
 const market = document.getElementById('market');
 const cards = [...document.querySelectorAll('.card')];
-let status = 'all';
+const filters = { status: 'all', tier: 'all' };
 function apply(){
   const needle = q.value.trim().toLowerCase();
+  let shown = 0;
   cards.forEach(card=>{
     const text = card.dataset.search;
     const okQ = !needle || text.includes(needle);
     const okM = market.value === 'all' || card.dataset.market === market.value;
-    const okS = status === 'all' || card.dataset.status === status;
-    card.style.display = (okQ && okM && okS) ? '' : 'none';
+    const okS = filters.status === 'all' || card.dataset.status === filters.status;
+    const okT = filters.tier === 'all' || card.dataset.tier === filters.tier;
+    const visible = okQ && okM && okS && okT;
+    card.style.display = visible ? '' : 'none';
+    if (visible) shown++;
   });
-  const shown = cards.filter(c=>c.style.display !== 'none').length;
   document.getElementById('count').textContent = shown;
 }
 q.addEventListener('input', apply);
 market.addEventListener('change', apply);
-document.querySelectorAll('.chip').forEach(chip=>{
+document.querySelectorAll('.chip[data-group]').forEach(chip=>{
   chip.addEventListener('click', ()=>{
-    document.querySelectorAll('.chip').forEach(c=>c.classList.remove('on'));
+    const group = chip.dataset.group;
+    filters[group] = chip.dataset.value;
+    document.querySelectorAll(`.chip[data-group="${group}"]`).forEach(c=>c.classList.remove('on'));
     chip.classList.add('on');
-    status = chip.dataset.status;
     apply();
   });
 });
@@ -308,6 +502,8 @@ def render(records: list[dict], zh: dict, out_path: Path) -> None:
     markets = sorted({r["marketplace"] for r in records})
     total = len(records)
     installed = sum(1 for r in records if r["installed"])
+    tiers = ("推荐", "可用", "仅接口", "需确认", "未下载", "不可用")
+    tier_counts = {tier: sum(1 for r in records if r["quality"]["tier"] == tier) for tier in tiers}
     translated_count = sum(1 for s in collect_strings(records) if s in zh)
     total_strings = len(collect_strings(records))
 
@@ -328,9 +524,30 @@ def render(records: list[dict], zh: dict, out_path: Path) -> None:
             if r["installed"]
             else '<span class="badge">未安装</span>'
         )
+        tier = r["quality"]["tier"]
+        tier_class = {
+            "推荐": "tier-good",
+            "可用": "tier-ok",
+            "仅接口": "tier-info",
+            "需确认": "tier-warn",
+            "未下载": "tier-none",
+            "不可用": "tier-bad",
+        }[tier]
+        tier_badge = f'<span class="badge {tier_class}">{tier}</span>'
         cat = f'<span class="badge cat">{escape(r["category"])}</span>' if r["category"] else ""
 
         detail_bits = []
+        quality = r["quality"]
+        quality_lines = [f"平台：{quality['platform']}"]
+        if quality["notes"]:
+            quality_lines.append("通过：" + "；".join(quality["notes"]))
+        if quality["risks"]:
+            quality_lines.append("注意：" + "；".join(quality["risks"]))
+        if quality["costs"]:
+            quality_lines.append("使用成本：" + "；".join(quality["costs"]))
+        detail_bits.append(
+            "<div class='kv'><b>评分</b><div>" + "<br>".join(escape(line) for line in quality_lines) + "</div></div>"
+        )
         if r["skills"]:
             items = []
             for s in r["skills"]:
@@ -345,8 +562,13 @@ def render(records: list[dict], zh: dict, out_path: Path) -> None:
         if r["agents"]:
             items = "".join(f'<li>{escape(a["name"])} — {escape(a["description"] or a["title"])}</li>' for a in r["agents"])
             detail_bits.append(f"<div class='kv'><b>子代理 ({len(r['agents'])})</b><ul>{items}</ul></div>")
-        if r["mcpServers"]:
-            detail_bits.append(f"<div class='kv'><b>MCP 服务</b>: {escape(', '.join(r['mcpServers']))}</div>")
+        if r["mcp"]["servers"]:
+            label = "、".join(
+                f"{name}（{'远程' if name in r['mcp']['remote'] else '本地'}）" for name in r["mcp"]["servers"]
+            )
+            detail_bits.append(f"<div class='kv'><b>MCP 服务</b>: {escape(label)}</div>")
+        if r["scripts"]:
+            detail_bits.append(f"<div class='kv'><b>附带脚本</b>: {escape(', '.join(r['scripts'][:6]))}</div>")
         if r["capabilities"]:
             caps = ", ".join(translated(c, zh) or c for c in r["capabilities"])
             detail_bits.append(f"<div class='kv'><b>能力</b>: {escape(caps)}</div>")
@@ -367,11 +589,14 @@ def render(records: list[dict], zh: dict, out_path: Path) -> None:
             + [translated(r["summary"], zh), translated(r["details"], zh)]
             + [s["name"] for s in r["skills"]]
             + [s["description"] for s in r["skills"]]
+            + r["quality"]["costs"]
+            + [r["quality"]["platform"]]
+            + (["本地即可", "不需要账号"] if not r["quality"]["needsAccount"] else [])
         ).lower()
 
         cards.append(
-            f"""<article class="card" data-status="{'on' if r['installed'] else 'off'}" data-market="{escape(r['marketplace'])}" data-search="{escape(search_blob)}">
-  <h2>{escape(r['displayName'])} {status_badge} {cat}</h2>
+            f"""<article class="card" data-status="{'on' if r['installed'] else 'off'}" data-tier="{escape(tier)}" data-market="{escape(r['marketplace'])}" data-search="{escape(search_blob)}">
+  <h2>{escape(r['displayName'])} {tier_badge} {status_badge} {cat}</h2>
   <div class="pid">{escape(r['pluginId'])} · v{escape(r['version'] or '?')} · {escape(r['developer'])}</div>
   {zh_or_en(r['summary'])}
   <details>
@@ -392,14 +617,18 @@ def render(records: list[dict], zh: dict, out_path: Path) -> None:
 <body>
 <header>
   <h1>Codex 插件目录</h1>
-  <div class="meta">共 {total} 个插件（已装 {installed}），来自 {len(markets)} 个市场 ｜ 中文覆盖 {translated_count}/{total_strings} 条文案 ｜ 生成于 {escape(__import__('time').strftime('%Y-%m-%d %H:%M'))}</div>
+  <div class="meta">共 {total} 个插件（已装 {installed}），来自 {len(markets)} 个市场 ｜ {" · ".join(f"{t} {tier_counts[t]}" for t in tiers)} ｜ 中文覆盖 {translated_count}/{total_strings} 条文案 ｜ 生成于 {escape(__import__('time').strftime('%Y-%m-%d %H:%M'))}</div>
   <div class="controls">
     <input id="q" type="search" placeholder="搜索插件名 / 技能 / 中文描述…">
     <select id="market"><option value="all">全部市场</option>{options}</select>
     <div class="chips">
-      <span class="chip on" data-status="all">全部</span>
-      <span class="chip" data-status="on">已安装</span>
-      <span class="chip" data-status="off">未安装</span>
+      <span class="chip on" data-group="tier" data-value="all">全部</span>
+      {"".join(f'<span class="chip" data-group="tier" data-value="{t}">{t} {tier_counts[t]}</span>' for t in tiers)}
+    </div>
+    <div class="chips">
+      <span class="chip on" data-group="status" data-value="all">安装状态不限</span>
+      <span class="chip" data-group="status" data-value="on">已安装</span>
+      <span class="chip" data-group="status" data-value="off">未安装</span>
     </div>
     <span class="meta">当前显示 <span id="count">{total}</span> 个</span>
   </div>
@@ -455,6 +684,14 @@ def main() -> None:
     out_path = Path(args.out)
     render(records, zh, out_path)
     print(f"catalog: {out_path} ({len(records)} plugins)")
+
+    for tier in ("推荐", "可用", "仅接口", "需确认", "未下载", "不可用"):
+        picked = [r for r in records if r["quality"]["tier"] == tier]
+        print(f"{tier}: {len(picked)}")
+        if tier in ("推荐", "不可用", "需确认"):
+            for r in picked:
+                reason = "；".join(r["quality"]["risks"]) or "；".join(r["quality"]["notes"])
+                print(f"  - {r['pluginId']}  [{reason}]")
 
     if args.json_out:
         json_path = Path(args.json_out)
