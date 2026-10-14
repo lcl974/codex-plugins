@@ -1,0 +1,34 @@
+{
+  "name": "starter",
+  "version": "0.1.0",
+  "description": "Minimal template plugin for the codex-plugins marketplace.",
+  "author": {
+    "name": "lcl974",
+    "url": "https://github.com/lcl974"
+  },
+  "homepage": "https://github.com/lcl974/codex-plugins",
+  "repository": "https://github.com/lcl974/codex-plugins",
+  "license": "MIT",
+  "keywords": [
+    "starter",
+    "template"
+  ],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Starter",
+    "shortDescription": "Minimal Codex plugin template",
+    "longDescription": "A copy-me template for building Codex plugins: one .codex-plugin/plugin.json manifest and one skill. Use it to verify that the codex-plugins marketplace is wired up correctly, then copy the folder to start your own plugin.",
+    "developerName": "lcl974",
+    "category": "Developer Tools",
+    "capabilities": [
+      "Read"
+    ],
+    "websiteURL": "https://github.com/lcl974/codex-plugins",
+    "defaultPrompt": [
+      "Run hello-codex to check this plugin is installed correctly.",
+      "Show me what this plugin exposes so I can copy it."
+    ],
+    "brandColor": "#2563EB",
+    "screenshots": []
+  }
+}

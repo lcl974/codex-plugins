@@ -1,0 +1,22 @@
+{
+  "name": "codex-plugins",
+  "interface": {
+    "displayName": "lcl974 Plugins"
+  },
+  "plugins": [
+    {
+      "name": "starter",
+      "displayName": "Starter",
+      "source": {
+        "source": "local",
+        "path": "./plugins/starter"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Developer Tools",
+      "description": "最小模板插件：一个 manifest + 一个 skill，用来验证市场链路，也当写新插件的样板。"
+    }
+  ]
+}
